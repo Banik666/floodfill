@@ -1,0 +1,585 @@
+#include <Arduino.h>
+#include <ESP32Encoder.h>
+
+// ============= CONFIGURATION SECTION =============
+// Pin Definitions
+#define MOTOR_LEFT_EN 12
+#define MOTOR_LEFT_IN1 14
+#define MOTOR_LEFT_IN2 27
+#define MOTOR_RIGHT_EN 13
+#define MOTOR_RIGHT_IN1 26
+#define MOTOR_RIGHT_IN2 25
+
+#define ENCODER_LEFT_A 18
+#define ENCODER_LEFT_B 5
+#define ENCODER_RIGHT_A 17
+#define ENCODER_RIGHT_B 16
+
+#define IR_FRONT 36
+#define IR_FRONT_LEFT 39
+#define IR_FRONT_RIGHT 34
+#define IR_LEFT 35
+#define IR_RIGHT 32
+
+// Physical Parameters (CALIBRATE THESE!)
+const float WHEEL_DIAMETER_MM = 42.0;        // Measure your actual wheel diameter
+const int ENCODER_CPR = 1000;                // Encoder counts per revolution
+const int GEAR_RATIO = 1;                    // Motor:wheel gear ratio (if any)
+
+// Control Parameters (TUNE THESE!)
+const int CELL_SIZE = 180;                   // Maze cell size in mm
+const int MAX_SPEED = 200;                   // Max PWM value (0-255)
+const float KP = 0.5;                        // Start with this PID proportional gain
+const float KI = 0.0;                        // Start with no integral gain
+const float KD = 0.05;                       // Start with this derivative gain
+const float KP_WALL = 0.3;                   // Wall-following proportional gain
+const int WALL_FOLLOW_THRESHOLD = 1500;      // Min sensor value to consider wall present
+const int TURN_TICKS = 500;                  // Encoder ticks for 90° turn (calibrate)
+const int WALL_DESIRED_DISTANCE = 1500;      // Desired sensor reading when centered
+
+// Algorithm Constants
+#define MAZE_SIZE 16
+#define NORTH 0
+#define EAST 1
+#define SOUTH 2
+#define WEST 3
+#define TARGET_X 7
+#define TARGET_Y 7
+// =================================================
+
+// Global Variables
+ESP32Encoder leftEncoder;
+ESP32Encoder rightEncoder;
+uint8_t walls[MAZE_SIZE][MAZE_SIZE][4] = {0};
+uint8_t flood[MAZE_SIZE][MAZE_SIZE];
+int currentX = 0;
+int currentY = 0;
+int currentDir = NORTH;
+int targetSpeed = MAX_SPEED;
+float errorSum = 0;
+float lastError = 0;
+unsigned long lastPIDTime = 0;
+bool optimized = false;
+bool runComplete = false;
+bool useWallFollowing = true;  // Enable/disable wall following
+
+// Pre-calculated movement parameters
+const float WHEEL_CIRCUMFERENCE = PI * WHEEL_DIAMETER_MM;
+const float REVS_PER_CELL = CELL_SIZE / WHEEL_CIRCUMFERENCE;
+const int TICKS_PER_CELL = REVS_PER_CELL * ENCODER_CPR * GEAR_RATIO;
+
+// Motor Control Functions
+void initMotors() {
+  ledcSetup(0, 30000, 8);  // 30kHz PWM, 8-bit resolution
+  ledcSetup(1, 30000, 8);
+  
+  ledcAttachPin(MOTOR_LEFT_EN, 0);
+  ledcAttachPin(MOTOR_RIGHT_EN, 1);
+  
+  pinMode(MOTOR_LEFT_IN1, OUTPUT);
+  pinMode(MOTOR_LEFT_IN2, OUTPUT);
+  pinMode(MOTOR_RIGHT_IN1, OUTPUT);
+  pinMode(MOTOR_RIGHT_IN2, OUTPUT);
+  
+  // Initialize motors to stop
+  setMotorSpeed(0, 0);
+}
+
+void setMotorSpeed(int leftSpeed, int rightSpeed) {
+  leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
+  rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
+  
+  // Left motor
+  if (leftSpeed >= 0) {
+    digitalWrite(MOTOR_LEFT_IN1, HIGH);
+    digitalWrite(MOTOR_LEFT_IN2, LOW);
+    ledcWrite(0, leftSpeed);
+  } else {
+    digitalWrite(MOTOR_LEFT_IN1, LOW);
+    digitalWrite(MOTOR_LEFT_IN2, HIGH);
+    ledcWrite(0, -leftSpeed);
+  }
+  
+  // Right motor
+  if (rightSpeed >= 0) {
+    digitalWrite(MOTOR_RIGHT_IN1, HIGH);
+    digitalWrite(MOTOR_RIGHT_IN2, LOW);
+    ledcWrite(1, rightSpeed);
+  } else {
+    digitalWrite(MOTOR_RIGHT_IN1, LOW);
+    digitalWrite(MOTOR_RIGHT_IN2, HIGH);
+    ledcWrite(1, -rightSpeed);
+  }
+}
+
+// Encoder Functions
+void initEncoders() {
+  ESP32Encoder::useInternalWeakPullResistors = UP;
+  leftEncoder.attachHalfQuad(ENCODER_LEFT_A, ENCODER_LEFT_B);
+  rightEncoder.attachHalfQuad(ENCODER_RIGHT_A, ENCODER_RIGHT_B);
+  leftEncoder.clearCount();
+  rightEncoder.clearCount();
+}
+
+int getLeftEncoderCount() { return leftEncoder.getCount(); }
+int getRightEncoderCount() { return rightEncoder.getCount(); }
+
+void resetEncoders() {
+  leftEncoder.clearCount();
+  rightEncoder.clearCount();
+}
+
+Surja Banik, [8/5/2025 4:10 PM]
+// IR Sensor Functions
+void initIRSensors() {
+  pinMode(IR_FRONT, INPUT);
+  pinMode(IR_FRONT_LEFT, INPUT);
+  pinMode(IR_FRONT_RIGHT, INPUT);
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+}
+
+int readSensor(int pin) {
+  // Average 5 readings for noise reduction
+  int sum = 0;
+  for (int i = 0; i < 5; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  return sum / 5;
+}
+
+bool detectWall(int sensorPin, int threshold = WALL_FOLLOW_THRESHOLD) {
+  return readSensor(sensorPin) > threshold;
+}
+
+void updateWalls() {
+  switch(currentDir) {
+    case NORTH:
+      walls[currentX][currentY][NORTH] = detectWall(IR_FRONT);
+      walls[currentX][currentY][WEST] = detectWall(IR_LEFT);
+      walls[currentX][currentY][EAST] = detectWall(IR_RIGHT);
+      break;
+    case EAST:
+      walls[currentX][currentY][EAST] = detectWall(IR_FRONT);
+      walls[currentX][currentY][NORTH] = detectWall(IR_LEFT);
+      walls[currentX][currentY][SOUTH] = detectWall(IR_RIGHT);
+      break;
+    case SOUTH:
+      walls[currentX][currentY][SOUTH] = detectWall(IR_FRONT);
+      walls[currentX][currentY][EAST] = detectWall(IR_LEFT);
+      walls[currentX][currentY][WEST] = detectWall(IR_RIGHT);
+      break;
+    case WEST:
+      walls[currentX][currentY][WEST] = detectWall(IR_FRONT);
+      walls[currentX][currentY][SOUTH] = detectWall(IR_LEFT);
+      walls[currentX][currentY][NORTH] = detectWall(IR_RIGHT);
+      break;
+  }
+  
+  // Front diagonal sensors for better corner detection
+  if (detectWall(IR_FRONT_LEFT)) {
+    walls[currentX][currentY][(currentDir + 3) % 4] = 1;
+  }
+  
+  if (detectWall(IR_FRONT_RIGHT)) {
+    walls[currentX][currentY][(currentDir + 1) % 4] = 1;
+  }
+}
+
+// Enhanced PID Controller with Wall Following
+void motorPID() {
+  unsigned long currentTime = micros();
+  float dt = (currentTime - lastPIDTime) / 1000000.0f;  // Convert to seconds
+  lastPIDTime = currentTime;
+  
+  // Skip if time interval is invalid
+  if (dt <= 0.0001f || dt > 0.1f) return;
+  
+  int leftCount = getLeftEncoderCount();
+  int rightCount = getRightEncoderCount();
+  
+  // Calculate error (difference in encoder counts)
+  int error = leftCount - rightCount;
+  
+  // PID terms
+  float P = KP * error;
+  errorSum += error * dt;
+  float I = KI * errorSum;
+  float D = KD * (error - lastError) / dt;
+  lastError = error;
+  
+  // Calculate motor adjustments
+  int adjustment = (int)(P + I + D);
+  
+  // Wall following correction (if enabled and walls present)
+  int wallCorrection = 0;
+  if (useWallFollowing) {
+    bool leftWall = detectWall(IR_LEFT);
+    bool rightWall = detectWall(IR_RIGHT);
+    
+    if (leftWall && rightWall) {
+      // Both walls present - center between them
+      int wallError = readSensor(IR_LEFT) - readSensor(IR_RIGHT);
+      wallCorrection = (int)(KP_WALL * wallError);
+    } else if (leftWall) {
+      // Only left wall present - follow at constant distance
+      wallCorrection = (int)(KP_WALL * (WALL_DESIRED_DISTANCE - readSensor(IR_LEFT)));
+    } else if (rightWall) {
+      // Only right wall present
+      wallCorrection = (int)(KP_WALL * (readSensor(IR_RIGHT) - WALL_DESIRED_DISTANCE));
+    }
+  }
+  
+  // Apply to motors
+  setMotorSpeed(targetSpeed - adjustment - wallCorrection, 
+                targetSpeed + adjustment + wallCorrection);
+}
+
+// Movement Functions with Improved Timing
+void moveForwardOneCell() {
+  // Reset encoders and PID state
+  resetEncoders();
+  errorSum = 0;
+  lastError = 0;
+  lastPIDTime = micros();
+  
+  int targetTicks = TICKS_PER_CELL;
+  targetSpeed = MAX_SPEED;
+  
+  unsigned long lastLoopTime = micros();
+  const unsigned long LOOP_INTERVAL = 5000;  // 5ms in microseconds (200Hz)
+  
+  while (abs(getLeftEncoderCount()) < targetTicks && 
+         abs(getRightEncoderCount()) < targetTicks) {
+    // Run PID at fixed interval
+    if (micros() - lastLoopTime >= LOOP_INTERVAL) {
+
+Surja Banik, [8/5/2025 4:10 PM]
+lastLoopTime = micros();
+      motorPID();
+    }
+  }
+  
+  // Stop motors
+  setMotorSpeed(0, 0);
+  
+  // Update position
+  switch(currentDir) {
+    case NORTH: currentY++; break;
+    case EAST: currentX++; break;
+    case SOUTH: currentY--; break;
+    case WEST: currentX--; break;
+  }
+  
+  // Ensure we're at the center of the cell
+  delay(50);
+}
+
+void turnLeft() {
+  resetEncoders();
+  int targetTicks = TURN_TICKS;
+  
+  // Turn left
+  setMotorSpeed(-MAX_SPEED/2, MAX_SPEED/2);
+  
+  unsigned long lastLoopTime = micros();
+  const unsigned long LOOP_INTERVAL = 2000;  // 2ms in microseconds
+  
+  while (abs(getLeftEncoderCount()) < targetTicks && 
+         abs(getRightEncoderCount()) < targetTicks) {
+    // Non-blocking delay
+    if (micros() - lastLoopTime >= LOOP_INTERVAL) {
+      lastLoopTime = micros();
+      // Could add PID here for turn if needed
+    }
+  }
+  
+  setMotorSpeed(0, 0);
+  currentDir = (currentDir + 3) % 4; // Update direction
+  delay(50); // Stabilization delay
+}
+
+void turnRight() {
+  resetEncoders();
+  int targetTicks = TURN_TICKS;
+  
+  // Turn right
+  setMotorSpeed(MAX_SPEED/2, -MAX_SPEED/2);
+  
+  unsigned long lastLoopTime = micros();
+  const unsigned long LOOP_INTERVAL = 2000;  // 2ms in microseconds
+  
+  while (abs(getLeftEncoderCount()) < targetTicks && 
+         abs(getRightEncoderCount()) < targetTicks) {
+    // Non-blocking delay
+    if (micros() - lastLoopTime >= LOOP_INTERVAL) {
+      lastLoopTime = micros();
+      // Could add PID here for turn if needed
+    }
+  }
+  
+  setMotorSpeed(0, 0);
+  currentDir = (currentDir + 1) % 4; // Update direction
+  delay(50); // Stabilization delay
+}
+
+void turnAround() {
+  turnRight();
+  turnRight();
+}
+
+// Maze Solving Algorithm
+void floodFill(bool toCenter = true) {
+  // Initialize flood values
+  for (int x = 0; x < MAZE_SIZE; x++) {
+    for (int y = 0; y < MAZE_SIZE; y++) {
+      flood[x][y] = 255;
+    }
+  }
+  
+  // Set target positions
+  if (toCenter) {
+    // Center 2x2 target area
+    flood[7][7] = 0;
+    flood[7][8] = 0;
+    flood[8][7] = 0;
+    flood[8][8] = 0;
+  } else {
+    // Start position
+    flood[0][0] = 0;
+  }
+  
+  // Queue for BFS
+  int queue[MAZE_SIZE * MAZE_SIZE][2];
+  int front = 0, rear = 0;
+  
+  // Add targets to queue
+  if (toCenter) {
+    queue[rear][0] = 7; queue[rear][1] = 7; rear++;
+    queue[rear][0] = 7; queue[rear][1] = 8; rear++;
+    queue[rear][0] = 8; queue[rear][1] = 7; rear++;
+    queue[rear][0] = 8; queue[rear][1] = 8; rear++;
+  } else {
+    queue[rear][0] = 0; queue[rear][1] = 0; rear++;
+  }
+  
+  while (front < rear) {
+    int x = queue[front][0];
+    int y = queue[front][1];
+    front++;
+    
+    // Check all 4 directions
+    for (int d = 0; d < 4; d++) {
+      int nx = x + (d == EAST) - (d == WEST);
+      int ny = y + (d == NORTH) - (d == SOUTH);
+      
+      // Check if neighbor is valid and accessible
+      if (nx >= 0 && nx < MAZE_SIZE && ny >= 0 && ny < MAZE_SIZE) {
+        if (!walls[x][y][d]) {
+          if (flood[nx][ny] > flood[x][y] + 1) {
+            flood[nx][ny] = flood[x][y] + 1;
+            queue[rear][0] = nx;
+            queue[rear][1] = ny;
+            rear++;
+          }
+        }
+      }
+    }
+  }
+}
+
+int getBestDirection() {
+  int minVal = flood[currentX][currentY];
+  int bestDir = -1;
+  
+  // Check all directions
+  for (int d = 0; d < 4; d++) {
+    int nx = currentX + (d == EAST) - (d == WEST);
+    int ny = currentY + (d == NORTH) - (d == SOUTH);
+    
+    // Skip if wall or invalid
+    if (nx < 0  nx >= MAZE_SIZE  ny < 0 || ny >= MAZE_SIZE) continue;
+    if (walls[currentX][currentY][d]) continue;
+    
+    // Check if better path
+    if (flood[nx][ny] < minVal) {
+      minVal = flood[nx][ny];
+      bestDir = d;
+    }
+  }
+  
+  return bestDir;
+}
+
+// Enhanced Debugging Functions
+void printMazeInfo() {
+  Serial.println("\n=== MAZE STATE ===");
+
+Surja Banik, [8/5/2025 4:10 PM]
+Serial.print("Position: ("); Serial.print(currentX);
+  Serial.print(", "); Serial.print(currentY); Serial.print(") ");
+  
+  Serial.print("Facing: ");
+  switch(currentDir) {
+    case NORTH: Serial.println("NORTH"); break;
+    case EAST: Serial.println("EAST"); break;
+    case SOUTH: Serial.println("SOUTH"); break;
+    case WEST: Serial.println("WEST"); break;
+  }
+  
+  Serial.println("Walls [N,E,S,W]:");
+  Serial.print(walls[currentX][currentY][NORTH]); Serial.print(" ");
+  Serial.print(walls[currentX][currentY][EAST]); Serial.print(" ");
+  Serial.print(walls[currentX][currentY][SOUTH]); Serial.print(" ");
+  Serial.println(walls[currentX][currentY][WEST]);
+  
+  Serial.println("Flood Values:");
+  for (int y = MAZE_SIZE-1; y >= 0; y--) {
+    for (int x = 0; x < MAZE_SIZE; x++) {
+      if (flood[x][y] < 10) Serial.print(" ");
+      if (flood[x][y] < 100) Serial.print(" ");
+      Serial.print(flood[x][y]);
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+}
+
+void printSensorReadings() {
+  Serial.println("\n=== SENSOR READINGS ===");
+  Serial.print("Front: "); Serial.print(readSensor(IR_FRONT));
+  Serial.print(" | Front Left: "); Serial.print(readSensor(IR_FRONT_LEFT));
+  Serial.print(" | Front Right: "); Serial.println(readSensor(IR_FRONT_RIGHT));
+  Serial.print("Left: "); Serial.print(readSensor(IR_LEFT));
+  Serial.print(" | Right: "); Serial.println(readSensor(IR_RIGHT));
+}
+
+void printSystemStatus() {
+  Serial.println("\n=== SYSTEM STATUS ===");
+  Serial.print("Left Encoder: "); Serial.print(getLeftEncoderCount());
+  Serial.print(" | Right Encoder: "); Serial.println(getRightEncoderCount());
+  Serial.print("Motor Speeds: L="); 
+  Serial.print(ledcRead(0)); Serial.print(" R="); 
+  Serial.println(ledcRead(1));
+  Serial.print("PID Values: KP="); Serial.print(KP);
+  Serial.print(" KI="); Serial.print(KI);
+  Serial.print(" KD="); Serial.println(KD);
+}
+
+void printCalibrationValues() {
+  Serial.println("\n=== CALIBRATION VALUES ===");
+  Serial.print("Wheel Diameter: "); Serial.print(WHEEL_DIAMETER_MM); Serial.println(" mm");
+  Serial.print("Encoder CPR: "); Serial.println(ENCODER_CPR);
+  Serial.print("Wheel Circumference: "); Serial.print(WHEEL_CIRCUMFERENCE); Serial.println(" mm");
+  Serial.print("Revs per cell: "); Serial.println(REVS_PER_CELL, 4);
+  Serial.print("Ticks per cell: "); Serial.println(TICKS_PER_CELL);
+  Serial.print("Ticks for 90° turn: "); Serial.println(TURN_TICKS);
+}
+
+// Setup and Main Loop
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);  // Wait for serial connection in debug mode
+  
+  Serial.println("\n===== MICROMOUSE INITIALIZATION =====");
+  
+  // Initialize hardware
+  initMotors();
+  Serial.println("Motors initialized");
+  
+  initEncoders();
+  Serial.println("Encoders initialized");
+  
+  initIRSensors();
+  Serial.println("IR Sensors initialized");
+  
+  // Initialize maze solving
+  floodFill(true);
+  Serial.println("Flood fill initialized");
+  
+  // Print calibration values
+  printCalibrationValues();
+  
+  Serial.println("\n===== STARTING MAZE EXPLORATION =====");
+}
+
+void loop() {
+  if (runComplete) {
+    // Competition complete
+    setMotorSpeed(0, 0);
+    Serial.println("\n!!! MAZE SOLVED OPTIMALLY !!!");
+    delay(5000);  // Long delay before restart or shutdown
+    return;
+  }
+  
+  // Update wall information
+  updateWalls();
+  
+  // Debugging output
+  printSensorReadings();
+  printMazeInfo();
+  printSystemStatus();
+  
+  // Recalculate flood fill
+  floodFill(true);
+  
+  // Get best direction to move
+  int nextDir = getBestDirection();
+  
+  if (nextDir == -1) {
+    // Dead end - turn around
+    turnAround();
+    Serial.println(">> ACTION: Dead end - turning around");
+  } else {
+    // Turn to face the best direction
+    int turnDir = (nextDir - currentDir + 4) % 4;
+    
+    switch(turnDir) {
+      case 1:
+
+Surja Banik, [8/5/2025 4:10 PM]
+turnRight();
+        Serial.println(">> ACTION: Turning right");
+        break;
+      case 2: 
+        turnAround();
+        Serial.println(">> ACTION: Turning around");
+        break;
+      case 3: 
+        turnLeft();
+        Serial.println(">> ACTION: Turning left");
+        break;
+      default:
+        Serial.println(">> ACTION: No turn needed");
+    }
+    
+    // Move forward one cell
+    moveForwardOneCell();
+    Serial.println(">> ACTION: Moving forward one cell");
+  }
+  
+  // Check if reached center
+  if (currentX >= 7 && currentX <= 8 && currentY >= 7 && currentY <= 8) {
+    if (!optimized) {
+      // First time reaching center - return to start
+      optimized = true;
+      Serial.println("\n* REACHED CENTER! RETURNING TO START *");
+      turnAround();
+    } else {
+      // Optimized run complete
+      runComplete = true;
+      Serial.println("\n* OPTIMIZED RUN COMPLETE! *");
+    }
+  }
+  
+  // If returning to start
+  if (optimized && currentX == 0 && currentY == 0) {
+    // Prepare for optimized run
+    floodFill(true);
+    Serial.println("\n* RETURNED TO START! BEGINNING OPTIMIZED RUN *");
+  }
+  
+  // Add short delay for stability
+  delay(100);
+}
