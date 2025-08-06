@@ -15,11 +15,11 @@
 #define ENCODER_RIGHT_A 17
 #define ENCODER_RIGHT_B 16
 
-#define IR_FRONT 36
-#define IR_FRONT_LEFT 39
-#define IR_FRONT_RIGHT 34
-#define IR_LEFT 35
-#define IR_RIGHT 32
+#define IR_FRONT        23
+#define IR_FRONT_LEFT   21
+#define IR_FRONT_RIGHT  14
+#define IR_LEFT         13
+#define IR_RIGHT        22
 
 // Physical Parameters (CALIBRATE THESE!)
 const float WHEEL_DIAMETER_MM = 42.0;        // Measure your actual wheel diameter
