@@ -70,14 +70,11 @@ const int TICKS_PER_CELL = REVS_PER_CELL * ENCODER_CPR * GEAR_RATIO;
 
 // Motor Control Functions
 void initMotors() {
-  ledcSetup(0, 30000, 8);  // 30kHz PWM, 8-bit resolution
-  ledcSetup(1, 30000, 8);
-  
-  ledcAttachPin(MOTOR_LEFT_EN, 0);
-  ledcAttachPin(MOTOR_RIGHT_EN, 1);
-  
+  // Set all motor control pins as outputs
+  pinMode(MOTOR_LEFT_EN, OUTPUT);
   pinMode(MOTOR_LEFT_IN1, OUTPUT);
   pinMode(MOTOR_LEFT_IN2, OUTPUT);
+  pinMode(MOTOR_RIGHT_EN, OUTPUT);
   pinMode(MOTOR_RIGHT_IN1, OUTPUT);
   pinMode(MOTOR_RIGHT_IN2, OUTPUT);
   
@@ -89,34 +86,42 @@ void setMotorSpeed(int leftSpeed, int rightSpeed) {
   leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
   rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
   
-  // Left motor
+  // Left motor control
   if (leftSpeed >= 0) {
     digitalWrite(MOTOR_LEFT_IN1, HIGH);
     digitalWrite(MOTOR_LEFT_IN2, LOW);
-    ledcWrite(0, leftSpeed);
+    analogWrite(MOTOR_LEFT_EN, leftSpeed);
   } else {
     digitalWrite(MOTOR_LEFT_IN1, LOW);
     digitalWrite(MOTOR_LEFT_IN2, HIGH);
-    ledcWrite(0, -leftSpeed);
+    analogWrite(MOTOR_LEFT_EN, -leftSpeed);
   }
   
-  // Right motor
+  // Right motor control
   if (rightSpeed >= 0) {
     digitalWrite(MOTOR_RIGHT_IN1, HIGH);
     digitalWrite(MOTOR_RIGHT_IN2, LOW);
-    ledcWrite(1, rightSpeed);
+    analogWrite(MOTOR_RIGHT_EN, rightSpeed);
   } else {
     digitalWrite(MOTOR_RIGHT_IN1, LOW);
     digitalWrite(MOTOR_RIGHT_IN2, HIGH);
-    ledcWrite(1, -rightSpeed);
+    analogWrite(MOTOR_RIGHT_EN, -rightSpeed);
   }
 }
 
 // Encoder Functions
 void initEncoders() {
-  ESP32Encoder::useInternalWeakPullResistors = UP;
-  leftEncoder.attachHalfQuad(ENCODER_LEFT_A, ENCODER_LEFT_B);
-  rightEncoder.attachHalfQuad(ENCODER_RIGHT_A, ENCODER_RIGHT_B);
+  // Use internal pull-up resistors
+  pinMode(ENCODER_LEFT_A, INPUT_PULLUP);
+  pinMode(ENCODER_LEFT_B, INPUT_PULLUP);
+  pinMode(ENCODER_RIGHT_A, INPUT_PULLUP);
+  pinMode(ENCODER_RIGHT_B, INPUT_PULLUP);
+  
+  // Attach encoders
+  leftEncoder.attachSingleEdge(ENCODER_LEFT_A, ENCODER_LEFT_B);
+  rightEncoder.attachSingleEdge(ENCODER_RIGHT_A, ENCODER_RIGHT_B);
+  
+  // Clear encoder counts
   leftEncoder.clearCount();
   rightEncoder.clearCount();
 }
@@ -129,7 +134,6 @@ void resetEncoders() {
   rightEncoder.clearCount();
 }
 
-Surja Banik, [8/5/2025 4:10 PM]
 // IR Sensor Functions
 void initIRSensors() {
   pinMode(IR_FRONT, INPUT);
@@ -254,9 +258,7 @@ void moveForwardOneCell() {
          abs(getRightEncoderCount()) < targetTicks) {
     // Run PID at fixed interval
     if (micros() - lastLoopTime >= LOOP_INTERVAL) {
-
-Surja Banik, [8/5/2025 4:10 PM]
-lastLoopTime = micros();
+      lastLoopTime = micros();
       motorPID();
     }
   }
@@ -375,15 +377,14 @@ void floodFill(bool toCenter = true) {
       int ny = y + (d == NORTH) - (d == SOUTH);
       
       // Check if neighbor is valid and accessible
-      if (nx >= 0 && nx < MAZE_SIZE && ny >= 0 && ny < MAZE_SIZE) {
-        if (!walls[x][y][d]) {
-          if (flood[nx][ny] > flood[x][y] + 1) {
-            flood[nx][ny] = flood[x][y] + 1;
-            queue[rear][0] = nx;
-            queue[rear][1] = ny;
-            rear++;
-          }
-        }
+      if (nx < 0 || nx >= MAZE_SIZE || ny < 0 || ny >= MAZE_SIZE) continue;
+      if (walls[x][y][d]) continue;
+      
+      if (flood[nx][ny] > flood[x][y] + 1) {
+        flood[nx][ny] = flood[x][y] + 1;
+        queue[rear][0] = nx;
+        queue[rear][1] = ny;
+        rear++;
       }
     }
   }
@@ -399,7 +400,7 @@ int getBestDirection() {
     int ny = currentY + (d == NORTH) - (d == SOUTH);
     
     // Skip if wall or invalid
-    if (nx < 0  nx >= MAZE_SIZE  ny < 0 || ny >= MAZE_SIZE) continue;
+    if (nx < 0 || nx >= MAZE_SIZE || ny < 0 || ny >= MAZE_SIZE) continue;
     if (walls[currentX][currentY][d]) continue;
     
     // Check if better path
@@ -415,9 +416,7 @@ int getBestDirection() {
 // Enhanced Debugging Functions
 void printMazeInfo() {
   Serial.println("\n=== MAZE STATE ===");
-
-Surja Banik, [8/5/2025 4:10 PM]
-Serial.print("Position: ("); Serial.print(currentX);
+  Serial.print("Position: ("); Serial.print(currentX);
   Serial.print(", "); Serial.print(currentY); Serial.print(") ");
   
   Serial.print("Facing: ");
@@ -459,9 +458,6 @@ void printSystemStatus() {
   Serial.println("\n=== SYSTEM STATUS ===");
   Serial.print("Left Encoder: "); Serial.print(getLeftEncoderCount());
   Serial.print(" | Right Encoder: "); Serial.println(getRightEncoderCount());
-  Serial.print("Motor Speeds: L="); 
-  Serial.print(ledcRead(0)); Serial.print(" R="); 
-  Serial.println(ledcRead(1));
   Serial.print("PID Values: KP="); Serial.print(KP);
   Serial.print(" KI="); Serial.print(KI);
   Serial.print(" KD="); Serial.println(KD);
@@ -536,10 +532,8 @@ void loop() {
     int turnDir = (nextDir - currentDir + 4) % 4;
     
     switch(turnDir) {
-      case 1:
-
-Surja Banik, [8/5/2025 4:10 PM]
-turnRight();
+      case 1: 
+        turnRight();
         Serial.println(">> ACTION: Turning right");
         break;
       case 2: 
@@ -564,12 +558,12 @@ turnRight();
     if (!optimized) {
       // First time reaching center - return to start
       optimized = true;
-      Serial.println("\n* REACHED CENTER! RETURNING TO START *");
+      Serial.println("\n*** REACHED CENTER! RETURNING TO START ***");
       turnAround();
     } else {
       // Optimized run complete
       runComplete = true;
-      Serial.println("\n* OPTIMIZED RUN COMPLETE! *");
+      Serial.println("\n*** OPTIMIZED RUN COMPLETE! ***");
     }
   }
   
@@ -577,7 +571,7 @@ turnRight();
   if (optimized && currentX == 0 && currentY == 0) {
     // Prepare for optimized run
     floodFill(true);
-    Serial.println("\n* RETURNED TO START! BEGINNING OPTIMIZED RUN *");
+    Serial.println("\n*** RETURNED TO START! BEGINNING OPTIMIZED RUN ***");
   }
   
   // Add short delay for stability
