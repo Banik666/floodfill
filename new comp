@@ -1,0 +1,445 @@
+#include <Arduino.h>
+#include <ESP32Encoder.h>
+
+// ============= CONFIGURATION SECTION =============
+// Pin Definitions
+#define MOTOR_LEFT_EN 5
+#define MOTOR_LEFT_IN1 17
+#define MOTOR_LEFT_IN2 16
+#define MOTOR_RIGHT_EN 4
+#define MOTOR_RIGHT_IN1 19
+#define MOTOR_RIGHT_IN2 18
+
+#define ENCODER_LEFT_A 26
+#define ENCODER_LEFT_B 25
+#define ENCODER_RIGHT_A 33
+#define ENCODER_RIGHT_B 32
+
+#define IR_FRONT        23
+#define IR_FRONT_LEFT   21
+#define IR_FRONT_RIGHT  14
+#define IR_LEFT         13
+#define IR_RIGHT        22
+
+// Physical Parameters
+const float WHEEL_DIAMETER_MM = 42.0;
+const int ENCODER_CPR = 1000;
+const int GEAR_RATIO = 1;
+
+// Control Parameters
+const int CELL_SIZE = 180;
+const int MAX_SPEED = 100;
+const float KP = 0.5;
+const float KI = 0.0;
+const float KD = 0.05;
+const float KP_WALL = 0.3;
+const int WALL_FOLLOW_THRESHOLD = 1500;
+const int TURN_TICKS = 500;
+const int WALL_DESIRED_DISTANCE = 1500;
+
+// Motor Sync Improvements
+const float MOTOR_BALANCE_FACTOR = 0.93f;
+const int MAX_SPEED_DIFFERENCE = 15;
+const int SYNC_THRESHOLD = 50;
+const float SYNC_KP = 1.8f;
+const float SYNC_KI = 0.02f;
+const float SYNC_KD = 0.4f;
+
+// Algorithm Constants
+#define MAZE_SIZE 16
+#define NORTH 0
+#define EAST 1
+#define SOUTH 2
+#define WEST 3
+#define TARGET_X 7
+#define TARGET_Y 7
+
+// Global Variables
+ESP32Encoder leftEncoder, rightEncoder;
+uint8_t walls[MAZE_SIZE][MAZE_SIZE][4] = {0};
+uint8_t flood[MAZE_SIZE][MAZE_SIZE];
+int currentX = 0;
+int currentY = 0;
+int currentDir = NORTH;
+int targetSpeed = MAX_SPEED;
+float errorSum = 0;
+float lastError = 0;
+unsigned long lastPIDTime = 0;
+bool optimized = false;
+bool runComplete = false;
+bool useWallFollowing = true;
+
+// Pre-calculated movement parameters
+const float WHEEL_CIRCUMFERENCE = PI * WHEEL_DIAMETER_MM;
+const float REVS_PER_CELL = CELL_SIZE / WHEEL_CIRCUMFERENCE;
+const int TICKS_PER_CELL = REVS_PER_CELL * ENCODER_CPR * GEAR_RATIO;
+
+// ============= MOTOR FUNCTIONS =============
+void initMotors() {
+  pinMode(MOTOR_LEFT_EN, OUTPUT);
+  pinMode(MOTOR_LEFT_IN1, OUTPUT);
+  pinMode(MOTOR_LEFT_IN2, OUTPUT);
+  pinMode(MOTOR_RIGHT_EN, OUTPUT);
+  pinMode(MOTOR_RIGHT_IN1, OUTPUT);
+  pinMode(MOTOR_RIGHT_IN2, OUTPUT);
+  setMotorSpeed(0, 0);
+}
+
+void setMotorSpeed(int leftSpeed, int rightSpeed) {
+  // Apply hardware compensation
+  leftSpeed = leftSpeed * MOTOR_BALANCE_FACTOR;
+  
+  // Enforce maximum speed difference
+  if (abs(leftSpeed - rightSpeed) > MAX_SPEED_DIFFERENCE) {
+    if (leftSpeed > rightSpeed) {
+      leftSpeed = rightSpeed + MAX_SPEED_DIFFERENCE;
+    } else {
+      rightSpeed = leftSpeed + MAX_SPEED_DIFFERENCE;
+    }
+  }
+  
+  // Constrain speeds
+  leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
+  rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
+  
+  // Left motor control
+  digitalWrite(MOTOR_LEFT_IN1, leftSpeed >= 0 ? HIGH : LOW);
+  digitalWrite(MOTOR_LEFT_IN2, leftSpeed >= 0 ? LOW : HIGH);
+  analogWrite(MOTOR_LEFT_EN, abs(leftSpeed));
+  
+  // Right motor control
+  digitalWrite(MOTOR_RIGHT_IN1, rightSpeed >= 0 ? HIGH : LOW);
+  digitalWrite(MOTOR_RIGHT_IN2, rightSpeed >= 0 ? LOW : HIGH);
+  analogWrite(MOTOR_RIGHT_EN, abs(rightSpeed));
+
+  // Debug output
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug > 200) {
+    lastDebug = millis();
+    Serial.printf("Motors: L=%d R=%d\n", leftSpeed, rightSpeed);
+  }
+}
+
+// ============= ENCODER FUNCTIONS =============
+void initEncoders() {
+  pinMode(ENCODER_LEFT_A, INPUT_PULLUP);
+  pinMode(ENCODER_LEFT_B, INPUT_PULLUP);
+  pinMode(ENCODER_RIGHT_A, INPUT_PULLUP);
+  pinMode(ENCODER_RIGHT_B, INPUT_PULLUP);
+  
+  leftEncoder.attachSingleEdge(ENCODER_LEFT_A, ENCODER_LEFT_B);
+  rightEncoder.attachSingleEdge(ENCODER_RIGHT_A, ENCODER_RIGHT_B);
+  resetEncoders();
+}
+
+int getLeftEncoderCount() { return leftEncoder.getCount(); }
+int getRightEncoderCount() { return rightEncoder.getCount(); }
+
+void resetEncoders() {
+  leftEncoder.clearCount();
+  rightEncoder.clearCount();
+}
+
+// ============= SENSOR FUNCTIONS =============
+void initIRSensors() {
+  pinMode(IR_FRONT, INPUT);
+  pinMode(IR_FRONT_LEFT, INPUT);
+  pinMode(IR_FRONT_RIGHT, INPUT);
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+}
+
+int readSensor(int pin) {
+  int sum = 0;
+  for (int i = 0; i < 5; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+  return sum / 5;
+}
+
+bool detectWall(int sensorPin, int threshold = WALL_FOLLOW_THRESHOLD) {
+  return readSensor(sensorPin) > threshold;
+}
+
+void updateWalls() {
+  switch(currentDir) {
+    case NORTH:
+      walls[currentX][currentY][NORTH] = detectWall(IR_FRONT);
+      walls[currentX][currentY][WEST] = detectWall(IR_LEFT);
+      walls[currentX][currentY][EAST] = detectWall(IR_RIGHT);
+      break;
+    case EAST:
+      walls[currentX][currentY][EAST] = detectWall(IR_FRONT);
+      walls[currentX][currentY][NORTH] = detectWall(IR_LEFT);
+      walls[currentX][currentY][SOUTH] = detectWall(IR_RIGHT);
+      break;
+    case SOUTH:
+      walls[currentX][currentY][SOUTH] = detectWall(IR_FRONT);
+      walls[currentX][currentY][EAST] = detectWall(IR_LEFT);
+      walls[currentX][currentY][WEST] = detectWall(IR_RIGHT);
+      break;
+    case WEST:
+      walls[currentX][currentY][WEST] = detectWall(IR_FRONT);
+      walls[currentX][currentY][SOUTH] = detectWall(IR_LEFT);
+      walls[currentX][currentY][NORTH] = detectWall(IR_RIGHT);
+      break;
+  }
+  
+  if (detectWall(IR_FRONT_LEFT)) {
+    walls[currentX][currentY][(currentDir + 3) % 4] = 1;
+  }
+  if (detectWall(IR_FRONT_RIGHT)) {
+    walls[currentX][currentY][(currentDir + 1) % 4] = 1;
+  }
+}
+
+// ============= ENHANCED PID CONTROLLER =============
+void motorPID() {
+  static unsigned long lastTime = micros();
+  unsigned long currentTime = micros();
+  float dt = (currentTime - lastTime) / 1000000.0f;
+  lastTime = currentTime;
+  
+  if (dt <= 0.0001f || dt > 0.1f) return;
+  
+  int leftPos = leftEncoder.getCount();
+  int rightPos = rightEncoder.getCount();
+  int error = leftPos - rightPos;
+  
+  // Emergency correction
+  if (abs(error) > SYNC_THRESHOLD) {
+    if (error > 0) {
+      setMotorSpeed(targetSpeed - 30, targetSpeed + 30);
+    } else {
+      setMotorSpeed(targetSpeed + 30, targetSpeed - 30);
+    }
+    return;
+  }
+  
+  // Enhanced PID terms
+  float P = SYNC_KP * error;
+  errorSum = constrain(errorSum + error * dt, -100, 100);
+  float I = SYNC_KI * errorSum;
+  float D = SYNC_KD * (error - lastError) / dt;
+  lastError = error;
+  
+  // Wall following correction
+  int wallCorrection = 0;
+  if (useWallFollowing) {
+    bool leftWall = detectWall(IR_LEFT);
+    bool rightWall = detectWall(IR_RIGHT);
+    
+    if (leftWall && rightWall) {
+      wallCorrection = (int)(KP_WALL * (readSensor(IR_LEFT) - readSensor(IR_RIGHT)));
+    } else if (leftWall) {
+      wallCorrection = (int)(KP_WALL * (WALL_DESIRED_DISTANCE - readSensor(IR_LEFT)));
+    } else if (rightWall) {
+      wallCorrection = (int)(KP_WALL * (readSensor(IR_RIGHT) - WALL_DESIRED_DISTANCE));
+    }
+  }
+  
+  setMotorSpeed(targetSpeed - (P + I + D) - wallCorrection, 
+               targetSpeed + (P + I + D) + wallCorrection);
+}
+
+// ============= MOVEMENT FUNCTIONS =============
+void moveForwardOneCell() {
+  resetEncoders();
+  errorSum = 0;
+  lastError = 0;
+  targetSpeed = MAX_SPEED;
+  
+  unsigned long startTime = millis();
+  while (abs(leftEncoder.getCount()) < TICKS_PER_CELL && 
+         abs(rightEncoder.getCount()) < TICKS_PER_CELL) {
+    motorPID();
+    
+    if (abs(leftEncoder.getCount() - rightEncoder.getCount()) > 2 * SYNC_THRESHOLD) {
+      Serial.println("EMERGENCY SYNC STOP");
+      break;
+    }
+    delay(5);
+  }
+  
+  setMotorSpeed(0, 0);
+  
+  // Update position
+  switch(currentDir) {
+    case NORTH: currentY++; break;
+    case EAST: currentX++; break;
+    case SOUTH: currentY--; break;
+    case WEST: currentX--; break;
+  }
+  delay(50);
+}
+
+void turnLeft() {
+  resetEncoders();
+  int targetTicks = TURN_TICKS;
+  setMotorSpeed(-MAX_SPEED/2, MAX_SPEED/2);
+  
+  while (abs(getLeftEncoderCount()) < targetTicks && 
+         abs(getRightEncoderCount()) < targetTicks) {
+    delay(2);
+  }
+  
+  setMotorSpeed(0, 0);
+  currentDir = (currentDir + 3) % 4;
+  delay(50);
+}
+
+void turnRight() {
+  resetEncoders();
+  int targetTicks = TURN_TICKS;
+  setMotorSpeed(MAX_SPEED/2, -MAX_SPEED/2);
+  
+  while (abs(getLeftEncoderCount()) < targetTicks && 
+         abs(getRightEncoderCount()) < targetTicks) {
+    delay(2);
+  }
+  
+  setMotorSpeed(0, 0);
+  currentDir = (currentDir + 1) % 4;
+  delay(50);
+}
+
+void turnAround() {
+  turnRight();
+  turnRight();
+}
+
+// ============= MAZE SOLVING =============
+void floodFill(bool toCenter = true) {
+  for (int x = 0; x < MAZE_SIZE; x++) {
+    for (int y = 0; y < MAZE_SIZE; y++) {
+      flood[x][y] = 255;
+    }
+  }
+  
+  if (toCenter) {
+    flood[7][7] = 0; flood[7][8] = 0;
+    flood[8][7] = 0; flood[8][8] = 0;
+  } else {
+    flood[0][0] = 0;
+  }
+  
+  int queue[MAZE_SIZE * MAZE_SIZE][2];
+  int front = 0, rear = 0;
+  
+  if (toCenter) {
+    queue[rear][0] = 7; queue[rear][1] = 7; rear++;
+    queue[rear][0] = 7; queue[rear][1] = 8; rear++;
+    queue[rear][0] = 8; queue[rear][1] = 7; rear++;
+    queue[rear][0] = 8; queue[rear][1] = 8; rear++;
+  } else {
+    queue[rear][0] = 0; queue[rear][1] = 0; rear++;
+  }
+  
+  while (front < rear) {
+    int x = queue[front][0];
+    int y = queue[front][1];
+    front++;
+    
+    for (int d = 0; d < 4; d++) {
+      int nx = x + (d == EAST) - (d == WEST);
+      int ny = y + (d == NORTH) - (d == SOUTH);
+      
+      if (nx < 0 || nx >= MAZE_SIZE || ny < 0 || ny >= MAZE_SIZE) continue;
+      if (walls[x][y][d]) continue;
+      
+      if (flood[nx][ny] > flood[x][y] + 1) {
+        flood[nx][ny] = flood[x][y] + 1;
+        queue[rear][0] = nx;
+        queue[rear][1] = ny;
+        rear++;
+      }
+    }
+  }
+}
+
+int getBestDirection() {
+  int minVal = flood[currentX][currentY];
+  int bestDir = -1;
+  
+  for (int d = 0; d < 4; d++) {
+    int nx = currentX + (d == EAST) - (d == WEST);
+    int ny = currentY + (d == NORTH) - (d == SOUTH);
+    
+    if (nx < 0 || nx >= MAZE_SIZE || ny < 0 || ny >= MAZE_SIZE) continue;
+    if (walls[currentX][currentY][d]) continue;
+    
+    if (flood[nx][ny] < minVal) {
+      minVal = flood[nx][ny];
+      bestDir = d;
+    }
+  }
+  return bestDir;
+}
+
+// ============= CALIBRATION =============
+void calibrateMotors() {
+  Serial.println("\n=== MOTOR CALIBRATION ===");
+  setMotorSpeed(150, 0);
+  delay(2000);
+  int leftTicks = abs(leftEncoder.getCount());
+  setMotorSpeed(0, 150);
+  delay(2000);
+  int rightTicks = abs(rightEncoder.getCount());
+  setMotorSpeed(0, 0);
+  
+  Serial.printf("Left ticks: %d, Right ticks: %d\n", leftTicks, rightTicks);
+  Serial.printf("Suggested balance factor: %.3f\n", (float)rightTicks/leftTicks);
+  delay(3000);
+}
+
+// ============= MAIN LOOP =============
+void setup() {
+  Serial.begin(115200);
+  initMotors();
+  initEncoders();
+  initIRSensors();
+  calibrateMotors();
+  floodFill(true);
+  Serial.println("System Ready");
+}
+
+void loop() {
+  if (runComplete) {
+    setMotorSpeed(0, 0);
+    Serial.println("\n!!! MAZE SOLVED !!!");
+    delay(5000);
+    return;
+  }
+  
+  updateWalls();
+  floodFill(true);
+  
+  int nextDir = getBestDirection();
+  
+  if (nextDir == -1) {
+    turnAround();
+    Serial.println(">> ACTION: Turn around");
+  } else {
+    int turnDir = (nextDir - currentDir + 4) % 4;
+    
+    switch(turnDir) {
+      case 1: turnRight(); break;
+      case 2: turnAround(); break;
+      case 3: turnLeft(); break;
+    }
+    moveForwardOneCell();
+  }
+  
+  // Check center condition
+  if (currentX >= 7 && currentX <= 8 && currentY >= 7 && currentY <= 8) {
+    if (!optimized) {
+      optimized = true;
+      turnAround();
+    } else {
+      runComplete = true;
+    }
+  }
+  
+  delay(100);
+}
